@@ -3,9 +3,11 @@ import type { HttpEffect } from "alchemy/Http";
 import * as Output from "alchemy/Output";
 import type { FunctionContext, FunctionListener } from "alchemy/Runtime/Function";
 import { packEnvValueKeepRedacted, unpackEnvValue } from "alchemy/RuntimeContext";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Tracer from "effect/Tracer";
 import type { WorkflowExport } from "../Workflows/Workflow.ts";
 import type { DurableObjectExport } from "./DurableObject.ts";
 import { makeRequestHandler } from "./HttpServer.ts";
@@ -25,8 +27,19 @@ export interface WorkerRuntimeContext extends FunctionContext {
   shape: () => Record<string, any>;
 }
 
+interface Listener {
+  listener: Effect.Effect<FunctionListener>;
+  /**
+   * The context `listen` was called in. A `cron`/`email`/`queue` handler is
+   * registered inside the Worker's init effect, so this holds whatever init
+   * provided to itself (`Effect.provide(...)`), which the handler's
+   * requirements were type-checked against.
+   */
+  services: Context.Context<never>;
+}
+
 export const makeWorkerRuntimeContext = (id: string): WorkerRuntimeContext => {
-  const listeners: Effect.Effect<FunctionListener>[] = [];
+  const listeners: Listener[] = [];
   const exports: Record<string, WorkerExport> = {};
   const env: Record<string, any> = {};
   let userShape: Record<string, unknown> | undefined;
@@ -65,10 +78,15 @@ export const makeWorkerRuntimeContext = (id: string): WorkerRuntimeContext => {
       return ctx.listen(makeRequestHandler(handler));
     },
     listen: ((handler: FunctionListener | Effect.Effect<FunctionListener>) =>
-      Effect.sync(() =>
-        Effect.isEffect(handler)
-          ? listeners.push(handler)
-          : listeners.push(Effect.succeed(handler)),
+      Effect.contextWith((services: Context.Context<never>) =>
+        Effect.sync(() =>
+          listeners.push({
+            listener: Effect.isEffect(handler) ? handler : Effect.succeed(handler),
+            // Drop the build's memo map (so a Layer provided inside a handler
+            // builds per event) and init's span (events trace on their own).
+            services: Context.omit(Layer.CurrentMemoMap, Tracer.ParentSpan)(services),
+          }),
+        ),
       )) as any as FunctionContext["listen"],
     export: (name: string, value: any) =>
       Effect.sync(() => {
@@ -78,9 +96,11 @@ export const makeWorkerRuntimeContext = (id: string): WorkerRuntimeContext => {
     hostServices: WebhookHostLive,
     planServices: Layer.mergeAll(Layer.succeed(WorkerEnvironment, {})),
     exports: Effect.gen(function* () {
-      const handlers = yield* Effect.all(listeners, {
-        concurrency: "unbounded",
-      });
+      const handlers = yield* Effect.forEach(
+        listeners,
+        ({ listener, services }) => Effect.map(listener, (handle) => ({ handle, services })),
+        { concurrency: "unbounded" },
+      );
       const services = yield* Effect.context();
 
       const dispatch =
@@ -94,14 +114,19 @@ export const makeWorkerRuntimeContext = (id: string): WorkerRuntimeContext => {
             context,
           };
           const effects: Effect.Effect<unknown>[] = [];
+          const handlerServices: Context.Context<never>[] = [];
           for (const handler of handlers) {
-            const eff = handler(event);
+            const eff = handler.handle(event);
             if (Effect.isEffect(eff)) {
               effects.push(eff);
+              handlerServices.push(handler.services);
             }
           }
+          // The bridge layers its per-event services (request `Scope`,
+          // execution context, telemetry) over the context returned here, so
+          // a handler sees what it registered with but never init's `Scope`.
           if (effects.length === 1) {
-            return [effects[0], services];
+            return [effects[0], handlerServices[0]];
           }
           if (effects.length > 1) {
             return [
@@ -113,7 +138,7 @@ export const makeWorkerRuntimeContext = (id: string): WorkerRuntimeContext => {
                   return results[results.length - 1];
                 }),
               ),
-              services,
+              Context.mergeAll(...handlerServices),
             ];
           }
           return [

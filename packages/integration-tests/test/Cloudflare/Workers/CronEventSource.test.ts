@@ -8,6 +8,7 @@ import * as HttpClient from "effect/http/HttpClient";
 import { MinimumLogLevel } from "effect/References";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import { ProvidedServiceCron } from "./fixtures/cron/cron-worker.ts";
 import Stack from "./fixtures/cron/stack.ts";
 
 const { test, beforeAll, afterAll, deploy, destroy } = Test.make({
@@ -28,7 +29,7 @@ test.provider(
       const { workerName, crons } = yield* stack;
       const { accountId } = yield* yield* CloudflareEnvironment;
       const { schedules } = yield* workers.getScriptSchedule({ accountId, scriptName: workerName });
-      expect(crons).toEqual(["* * * * *"]);
+      expect(crons).toEqual(["* * * * *", ProvidedServiceCron]);
       expect(schedules.map(({ cron }) => cron)).toEqual(crons);
       yield* scratch.destroy();
     }).pipe(logLevel),
